@@ -43,7 +43,9 @@ def get_conn():
 
 def require_v7_key(x_v7_api_key: str = Header(default="", alias="X-V7-API-KEY")) -> None:
     expected = os.getenv("V7_API_KEY", "")
-    if not expected or not x_v7_api_key or not hmac.compare_digest(x_v7_api_key, expected):
+    if not expected or not x_v7_api_key:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    if not hmac.compare_digest(x_v7_api_key.encode("utf-8"), expected.encode("utf-8")):
         raise HTTPException(status_code=401, detail="Unauthorized")
 
 
@@ -228,10 +230,11 @@ def list_dealer_orders(status: str = "pending", page: int = 1, page_size: int = 
         with conn.cursor() as cur:
             cur.execute(
                 """
-                SELECT DISTINCT order_no
+                SELECT order_no
                 FROM dealer_orders
                 WHERE status=%s
-                ORDER BY created_at DESC, order_no DESC
+                GROUP BY order_no
+                ORDER BY MAX(created_at) DESC, order_no DESC
                 LIMIT %s OFFSET %s
                 """,
                 (status, page_size, offset),
@@ -440,3 +443,4 @@ def allocate_order_lines(order_no: str, payload: AllocateLinesPayload, request: 
         save_idempotent_response(conn, idempotency_key, "POST", path, result)
         conn.commit()
         return result
+
