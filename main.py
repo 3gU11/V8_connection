@@ -12,6 +12,7 @@ from pydantic import BaseModel, Field
 
 
 app = FastAPI(title="V7 Cloud Bridge", version="1.0.0")
+BUILD_VERSION = "2026-05-19-c50536b-debug-db"
 
 
 def _db_config() -> dict[str, Any]:
@@ -215,7 +216,40 @@ class AllocateLinesPayload(BaseModel):
 
 @app.get("/health")
 def health():
-    return {"ok": True}
+    return {"ok": True, "version": BUILD_VERSION}
+
+
+@app.get("/api/v7/debug/db", dependencies=[Depends(require_v7_key)])
+def debug_db():
+    config = _db_config()
+    masked_config = {
+        "host": config["host"],
+        "port": config["port"],
+        "user": config["user"],
+        "database": config["database"],
+        "has_password": bool(config["password"]),
+    }
+    result: dict[str, Any] = {
+        "version": BUILD_VERSION,
+        "config": masked_config,
+        "connected": False,
+        "dealer_orders_exists": False,
+    }
+    with get_conn() as conn:
+        result["connected"] = True
+        with conn.cursor() as cur:
+            cur.execute("SELECT DATABASE() AS db, CURRENT_USER() AS user")
+            result["session"] = cur.fetchone()
+            cur.execute("SHOW TABLES LIKE 'dealer_orders'")
+            result["dealer_orders_exists"] = cur.fetchone() is not None
+            if result["dealer_orders_exists"]:
+                cur.execute("SHOW COLUMNS FROM dealer_orders")
+                result["columns"] = [row["Field"] for row in cur.fetchall()]
+                cur.execute("SELECT status, COUNT(*) AS count FROM dealer_orders GROUP BY status ORDER BY status")
+                result["status_counts"] = list(cur.fetchall())
+                cur.execute("SELECT COUNT(*) AS count FROM dealer_orders")
+                result["total"] = cur.fetchone()
+    return result
 
 
 @app.get("/api/v7/dealer-orders", dependencies=[Depends(require_v7_key)])
