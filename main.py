@@ -12,7 +12,16 @@ from pydantic import BaseModel, Field
 
 
 app = FastAPI(title="V7 Cloud Bridge", version="1.0.0")
-BUILD_VERSION = "2026-05-19-c50536b-debug-db"
+BUILD_VERSION = "2026-05-19-json-utf8-charset"
+
+
+@app.middleware("http")
+async def add_json_utf8_charset(request: Request, call_next):
+    response = await call_next(request)
+    content_type = response.headers.get("content-type", "")
+    if content_type.startswith("application/json") and "charset=" not in content_type.lower():
+        response.headers["content-type"] = "application/json; charset=utf-8"
+    return response
 
 
 def _db_config() -> dict[str, Any]:
