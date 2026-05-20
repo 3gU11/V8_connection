@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import hmac
 import json
 import os
@@ -12,7 +13,7 @@ from pydantic import BaseModel, Field
 
 
 app = FastAPI(title="V7 Cloud Bridge", version="1.0.0")
-BUILD_VERSION = "2026-05-19-json-utf8-charset"
+BUILD_VERSION = "2026-05-20-wechat-batch-summary-sync"
 
 
 @app.middleware("http")
@@ -193,6 +194,24 @@ def save_idempotent_response(conn, idem_key: str, method: str, path: str, payloa
         )
 
 
+
+class BatchSummaryRow(BaseModel):
+    summary_id: str = ""
+    batch_no: str
+    expected_inbound_time: str | None = None
+    model: str
+    quantity: int = Field(ge=0)
+    批次号: str = ""
+    预计入库时间: str | None = None
+    机型: str = ""
+    数量: int | None = None
+    更新时间: str | None = None
+
+
+class BatchSummarySyncPayload(BaseModel):
+    mode: str = "replace"
+    rows: list[BatchSummaryRow]
+
 class ReviewPayload(BaseModel):
     status: str = Field(pattern="^(approved|rejected)$")
     reviewedBy: str = ""
@@ -222,6 +241,72 @@ class AllocateLinesPayload(BaseModel):
     allocatedBy: str = ""
     items: list[AllocateLineItem]
 
+
+
+def ensure_wechat_batch_summary_table(conn) -> None:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS wechat_batch_summary (
+              summary_id CHAR(32) NOT NULL,
+              batch_no VARCHAR(100) NOT NULL,
+              expected_inbound_time DATETIME NULL,
+              model VARCHAR(100) NOT NULL,
+              quantity INT NOT NULL DEFAULT 0,
+              heightened TINYINT(1) NOT NULL DEFAULT 0,
+              original_batch_no VARCHAR(100) DEFAULT '',
+              original_expected_inbound_time DATETIME NULL,
+              updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+              `批次号` VARCHAR(100) NOT NULL,
+              `预计入库时间` DATETIME NULL,
+              `机型` VARCHAR(100) NOT NULL,
+              `数量` INT NOT NULL DEFAULT 0,
+              `更新时间` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+              PRIMARY KEY (summary_id),
+              INDEX idx_wechat_batch_summary_batch (batch_no),
+              INDEX idx_wechat_batch_summary_inbound (expected_inbound_time),
+              INDEX idx_wechat_batch_summary_model (model)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            """
+        )
+        cur.execute("SHOW COLUMNS FROM wechat_batch_summary")
+        existing = {row["Field"] for row in cur.fetchall()}
+        for name, ddl in {
+            "heightened": "ALTER TABLE wechat_batch_summary ADD COLUMN heightened TINYINT(1) NOT NULL DEFAULT 0 AFTER quantity",
+            "original_batch_no": "ALTER TABLE wechat_batch_summary ADD COLUMN original_batch_no VARCHAR(100) DEFAULT '' AFTER heightened",
+            "original_expected_inbound_time": "ALTER TABLE wechat_batch_summary ADD COLUMN original_expected_inbound_time DATETIME NULL AFTER original_batch_no",
+            "updated_at": "ALTER TABLE wechat_batch_summary ADD COLUMN updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP AFTER original_expected_inbound_time",
+            "批次号": "ALTER TABLE wechat_batch_summary ADD COLUMN `批次号` VARCHAR(100) NOT NULL DEFAULT '' AFTER updated_at",
+            "预计入库时间": "ALTER TABLE wechat_batch_summary ADD COLUMN `预计入库时间` DATETIME NULL AFTER `批次号`",
+            "机型": "ALTER TABLE wechat_batch_summary ADD COLUMN `机型` VARCHAR(100) NOT NULL DEFAULT '' AFTER `预计入库时间`",
+            "数量": "ALTER TABLE wechat_batch_summary ADD COLUMN `数量` INT NOT NULL DEFAULT 0 AFTER `机型`",
+            "更新时间": "ALTER TABLE wechat_batch_summary ADD COLUMN `更新时间` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP AFTER `数量`",
+        }.items():
+            if name not in existing:
+                cur.execute(ddl)
+
+
+def _clean_text(value: Any, default: str = "") -> str:
+    if value is None:
+        return default
+    return str(value).strip()
+
+
+def _empty_to_none(value: Any) -> Any:
+    cleaned = _clean_text(value)
+    return cleaned or None
+
+
+def _batch_summary_id(row: BatchSummaryRow) -> str:
+    supplied = _clean_text(row.summary_id)
+    if supplied:
+        return supplied[:32]
+    raw = "|".join([
+        _clean_text(row.batch_no),
+        _clean_text(row.expected_inbound_time),
+        _clean_text(row.model),
+    ])
+    return hashlib.md5(raw.encode("utf-8")).hexdigest()
 
 @app.get("/health")
 def health():
@@ -260,6 +345,44 @@ def debug_db():
                 result["total"] = cur.fetchone()
     return result
 
+
+
+@app.post("/api/v7/wechat-batch-summary/sync", dependencies=[Depends(require_v7_key)])
+def sync_wechat_batch_summary(payload: BatchSummarySyncPayload):
+    if payload.mode != "replace":
+        raise HTTPException(status_code=422, detail="Only replace mode is supported")
+    with get_conn() as conn:
+        ensure_wechat_batch_summary_table(conn)
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM wechat_batch_summary")
+            insert_sql = """
+                INSERT INTO wechat_batch_summary
+                  (summary_id, batch_no, expected_inbound_time, model, quantity,
+                   `批次号`, `预计入库时间`, `机型`, `数量`)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+            """
+            for row in payload.rows:
+                batch_no = _clean_text(row.batch_no)
+                model = _clean_text(row.model)
+                if not batch_no or not model:
+                    continue
+                quantity = int(row.quantity or 0)
+                cur.execute(
+                    insert_sql,
+                    (
+                        _batch_summary_id(row),
+                        batch_no,
+                        _empty_to_none(row.expected_inbound_time),
+                        model,
+                        quantity,
+                        _clean_text(row.批次号, batch_no) or batch_no,
+                        _empty_to_none(row.预计入库时间 or row.expected_inbound_time),
+                        _clean_text(row.机型, model) or model,
+                        int(row.数量 if row.数量 is not None else quantity),
+                    ),
+                )
+        conn.commit()
+    return {"message": "ok", "rows": len(payload.rows)}
 
 @app.get("/api/v7/dealer-orders", dependencies=[Depends(require_v7_key)])
 def list_dealer_orders(status: str = "pending", page: int = 1, page_size: int = 100):
@@ -486,4 +609,3 @@ def allocate_order_lines(order_no: str, payload: AllocateLinesPayload, request: 
         save_idempotent_response(conn, idempotency_key, "POST", path, result)
         conn.commit()
         return result
-
