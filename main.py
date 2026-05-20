@@ -13,7 +13,7 @@ from pydantic import BaseModel, Field
 
 
 app = FastAPI(title="V7 Cloud Bridge", version="1.0.0")
-BUILD_VERSION = "2026-05-20-wechat-batch-summary-sync"
+BUILD_VERSION = "2026-05-20-dealer-order-complete"
 
 
 @app.middleware("http")
@@ -228,6 +228,10 @@ class AllocatePayload(BaseModel):
     contractNo: str = ""
     v7OrderNo: str = ""
     allocatedBy: str = ""
+
+class CompletePayload(BaseModel):
+    v7OrderNo: str = ""
+    completedBy: str = ""
 
 
 class AllocateLineItem(BaseModel):
@@ -549,6 +553,50 @@ def allocate_order(order_no: str, payload: AllocatePayload, request: Request, id
         conn.commit()
         return result
 
+
+
+@app.post("/api/v7/dealer-orders/{order_no}/complete", dependencies=[Depends(require_v7_key)])
+def complete_order(order_no: str, payload: CompletePayload, request: Request, idempotency_key: str = Header(default="", alias="Idempotency-Key")):
+    path = str(request.url.path)
+    with get_conn() as conn:
+        ensure_support_tables(conn)
+        cached = get_idempotent_response(conn, idempotency_key, "POST", path)
+        if cached:
+            return cached
+        rows = fetch_order(conn, order_no, for_update=True)
+        old_statuses = {str(row.get("status") or "") for row in rows}
+        if not rows:
+            raise HTTPException(status_code=404, detail="Order not found")
+        if not old_statuses.issubset({"approved", "contracted", "partial_allocated", "allocated", "completed"}):
+            raise HTTPException(status_code=409, detail="Complete only supports approved, contracted, allocated or completed orders")
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE dealer_orders
+                SET status='completed', allocated_qty=quantity,
+                    v7_order_no=CASE WHEN COALESCE(v7_order_no, '')='' THEN %s ELSE v7_order_no END,
+                    reviewed_by=CASE WHEN COALESCE(reviewed_by, '')='' THEN %s ELSE reviewed_by END,
+                    reviewed_at=COALESCE(reviewed_at, NOW())
+                WHERE order_no=%s
+                """,
+                (payload.v7OrderNo, payload.completedBy, order_no),
+            )
+        result = {"message": "ok", "order": summarize_order(fetch_order(conn, order_no))}
+        log_operation(
+            conn,
+            order_no=order_no,
+            operation="complete",
+            operator=payload.completedBy,
+            source_ip=request.client.host if request.client else "",
+            old_status=",".join(sorted(old_statuses)),
+            new_status="completed",
+            idem_key=idempotency_key,
+            result="success",
+            detail=payload.v7OrderNo,
+        )
+        save_idempotent_response(conn, idempotency_key, "POST", path, result)
+        conn.commit()
+        return result
 
 @app.post("/api/v7/dealer-orders/{order_no}/allocate-lines", dependencies=[Depends(require_v7_key)])
 def allocate_order_lines(order_no: str, payload: AllocateLinesPayload, request: Request, idempotency_key: str = Header(default="", alias="Idempotency-Key")):
