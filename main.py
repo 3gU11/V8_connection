@@ -13,7 +13,7 @@ from pydantic import BaseModel, Field
 
 
 app = FastAPI(title="V7 Cloud Bridge", version="1.0.0")
-BUILD_VERSION = "2026-05-20-wechat-summary-heightened"
+BUILD_VERSION = "2026-05-20-wechat-summary-english"
 
 
 @app.middleware("http")
@@ -205,14 +205,6 @@ class BatchSummaryRow(BaseModel):
     original_batch_no: str = ""
     original_expected_inbound_time: str | None = None
     updated_at: str | None = None
-    批次号: str = ""
-    预计入库时间: str | None = None
-    机型: str = ""
-    数量: int | None = None
-    加高: int | None = None
-    原批次号: str = ""
-    原预计入库时间: str | None = None
-    更新时间: str | None = None
 
 
 class BatchSummarySyncPayload(BaseModel):
@@ -268,14 +260,6 @@ def ensure_wechat_batch_summary_table(conn) -> None:
               original_batch_no VARCHAR(100) DEFAULT '',
               original_expected_inbound_time DATETIME NULL,
               updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-              `批次号` VARCHAR(100) NOT NULL,
-              `预计入库时间` DATETIME NULL,
-              `机型` VARCHAR(100) NOT NULL,
-              `数量` INT NOT NULL DEFAULT 0,
-              `加高` TINYINT(1) NOT NULL DEFAULT 0,
-              `原批次号` VARCHAR(100) DEFAULT '',
-              `原预计入库时间` DATETIME NULL,
-              `更新时间` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
               PRIMARY KEY (summary_id),
               INDEX idx_wechat_batch_summary_batch (batch_no),
               INDEX idx_wechat_batch_summary_inbound (expected_inbound_time),
@@ -290,14 +274,6 @@ def ensure_wechat_batch_summary_table(conn) -> None:
             "original_batch_no": "ALTER TABLE wechat_batch_summary ADD COLUMN original_batch_no VARCHAR(100) DEFAULT '' AFTER heightened",
             "original_expected_inbound_time": "ALTER TABLE wechat_batch_summary ADD COLUMN original_expected_inbound_time DATETIME NULL AFTER original_batch_no",
             "updated_at": "ALTER TABLE wechat_batch_summary ADD COLUMN updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP AFTER original_expected_inbound_time",
-            "批次号": "ALTER TABLE wechat_batch_summary ADD COLUMN `批次号` VARCHAR(100) NOT NULL DEFAULT '' AFTER updated_at",
-            "预计入库时间": "ALTER TABLE wechat_batch_summary ADD COLUMN `预计入库时间` DATETIME NULL AFTER `批次号`",
-            "机型": "ALTER TABLE wechat_batch_summary ADD COLUMN `机型` VARCHAR(100) NOT NULL DEFAULT '' AFTER `预计入库时间`",
-            "数量": "ALTER TABLE wechat_batch_summary ADD COLUMN `数量` INT NOT NULL DEFAULT 0 AFTER `机型`",
-            "加高": "ALTER TABLE wechat_batch_summary ADD COLUMN `加高` TINYINT(1) NOT NULL DEFAULT 0 AFTER `数量`",
-            "原批次号": "ALTER TABLE wechat_batch_summary ADD COLUMN `原批次号` VARCHAR(100) DEFAULT '' AFTER `加高`",
-            "原预计入库时间": "ALTER TABLE wechat_batch_summary ADD COLUMN `原预计入库时间` DATETIME NULL AFTER `原批次号`",
-            "更新时间": "ALTER TABLE wechat_batch_summary ADD COLUMN `更新时间` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP AFTER `原预计入库时间`",
         }.items():
             if name not in existing:
                 cur.execute(ddl)
@@ -377,10 +353,8 @@ def sync_wechat_batch_summary(payload: BatchSummarySyncPayload):
             insert_sql = """
                 INSERT INTO wechat_batch_summary
                   (summary_id, batch_no, expected_inbound_time, model, quantity,
-                   heightened, original_batch_no, original_expected_inbound_time,
-                   `批次号`, `预计入库时间`, `机型`, `数量`,
-                   `加高`, `原批次号`, `原预计入库时间`)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                   heightened, original_batch_no, original_expected_inbound_time)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
             """
             for row in payload.rows:
                 batch_no = _clean_text(row.batch_no)
@@ -388,9 +362,9 @@ def sync_wechat_batch_summary(payload: BatchSummarySyncPayload):
                 if not batch_no or not model:
                     continue
                 quantity = int(row.quantity or 0)
-                heightened = int(row.加高 if row.加高 is not None else row.heightened or 0)
-                original_batch_no = _clean_text(row.original_batch_no or row.原批次号)
-                original_expected = row.original_expected_inbound_time or row.原预计入库时间
+                heightened = int(row.heightened or 0)
+                original_batch_no = _clean_text(row.original_batch_no)
+                original_expected = row.original_expected_inbound_time
                 cur.execute(
                     insert_sql,
                     (
@@ -402,13 +376,6 @@ def sync_wechat_batch_summary(payload: BatchSummarySyncPayload):
                         heightened,
                         original_batch_no,
                         _empty_to_none(original_expected),
-                        _clean_text(row.批次号, batch_no) or batch_no,
-                        _empty_to_none(row.预计入库时间 or row.expected_inbound_time),
-                        _clean_text(row.机型, model) or model,
-                        int(row.数量 if row.数量 is not None else quantity),
-                        heightened,
-                        _clean_text(row.原批次号, original_batch_no) or original_batch_no,
-                        _empty_to_none(row.原预计入库时间 or original_expected),
                     ),
                 )
         conn.commit()
