@@ -13,7 +13,7 @@ from pydantic import BaseModel, Field
 
 
 app = FastAPI(title="V7 Cloud Bridge", version="1.0.0")
-BUILD_VERSION = "2026-05-20-wechat-summary-english"
+BUILD_VERSION = "2026-05-21-extra-review-factory-pending"
 
 
 @app.middleware("http")
@@ -96,6 +96,15 @@ def ensure_support_tables(conn) -> None:
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
             """
         )
+        cur.execute("SHOW COLUMNS FROM dealer_orders")
+        existing = {row["Field"] for row in cur.fetchall()}
+        for name, ddl in {
+            "extra_remark": "ALTER TABLE dealer_orders ADD COLUMN extra_remark TEXT AFTER remark",
+            "ERMQ": "ALTER TABLE dealer_orders ADD COLUMN ERMQ INT NOT NULL DEFAULT 0 AFTER extra_remark",
+            "factory_pending": "ALTER TABLE dealer_orders ADD COLUMN factory_pending TINYINT(1) NOT NULL DEFAULT 0 AFTER ERMQ",
+        }.items():
+            if name not in existing:
+                cur.execute(ddl)
 
 
 def row_to_jsonable(row: dict[str, Any]) -> dict[str, Any]:
@@ -215,6 +224,7 @@ class ReviewPayload(BaseModel):
     status: str = Field(pattern="^(approved|rejected)$")
     reviewedBy: str = ""
     reviewNote: str = ""
+    factory_pending: int | None = None
 
 
 class ContractPayload(BaseModel):
@@ -419,27 +429,40 @@ def review_order(order_no: str, payload: ReviewPayload, request: Request, idempo
         old_statuses = {str(row.get("status") or "") for row in rows}
         if not rows:
             raise HTTPException(status_code=404, detail="Order not found")
-        if old_statuses != {"pending"}:
+        is_extra_review = payload.factory_pending is not None
+        if old_statuses != {"pending"} and not is_extra_review:
             raise HTTPException(status_code=409, detail="Review only supports pending orders")
         new_status = payload.status
         with conn.cursor() as cur:
-            if new_status == "approved":
+            if is_extra_review and new_status == "approved":
                 cur.execute(
                     """
                     UPDATE dealer_orders
-                    SET status='approved', approved_qty=quantity, reviewed_by=%s, reviewed_at=NOW(), review_note=%s
+                    SET factory_pending=%s, reviewed_by=%s, reviewed_at=NOW(),
+                        review_note=CASE WHEN %s='' THEN review_note ELSE %s END
+                    WHERE order_no=%s AND status NOT IN ('completed', 'complete')
+                    """,
+                    (int(payload.factory_pending or 0), payload.reviewedBy, payload.reviewNote, payload.reviewNote, order_no),
+                )
+            elif new_status == "approved":
+                cur.execute(
+                    """
+                    UPDATE dealer_orders
+                    SET status='approved', approved_qty=quantity, reviewed_by=%s, reviewed_at=NOW(), review_note=%s,
+                        factory_pending=COALESCE(%s, factory_pending)
                     WHERE order_no=%s AND status='pending'
                     """,
-                    (payload.reviewedBy, payload.reviewNote, order_no),
+                    (payload.reviewedBy, payload.reviewNote, payload.factory_pending, order_no),
                 )
             else:
                 cur.execute(
                     """
                     UPDATE dealer_orders
-                    SET status='rejected', reviewed_by=%s, reviewed_at=NOW(), review_note=%s
-                    WHERE order_no=%s AND status='pending'
+                    SET status='rejected', reviewed_by=%s, reviewed_at=NOW(), review_note=%s,
+                        factory_pending=COALESCE(%s, factory_pending)
+                    WHERE order_no=%s AND (status='pending' OR %s IS NOT NULL)
                     """,
-                    (payload.reviewedBy, payload.reviewNote, order_no),
+                    (payload.reviewedBy, payload.reviewNote, payload.factory_pending, order_no, payload.factory_pending),
                 )
         result = {"message": "ok", "order": summarize_order(fetch_order(conn, order_no))}
         log_operation(
