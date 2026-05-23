@@ -13,7 +13,7 @@ from pydantic import BaseModel, Field
 
 
 app = FastAPI(title="V7 Cloud Bridge", version="1.0.0")
-BUILD_VERSION = "2026-05-21-extra-review-factory-pending"
+BUILD_VERSION = "2026-05-23-v8-status-endpoint"
 
 
 @app.middleware("http")
@@ -203,6 +203,29 @@ def save_idempotent_response(conn, idem_key: str, method: str, path: str, payloa
         )
 
 
+# ---------------------------------------------------------------------------
+# Status rank helper — higher rank = further along in the workflow
+# ---------------------------------------------------------------------------
+_STATUS_RANK: dict[str, int] = {
+    "pending": 0,
+    "approved": 1,
+    "contracted": 2,
+    "partial_allocated": 3,
+    "allocated": 4,
+    "completed": 5,
+    "complete": 5,
+    "rejected": 6,
+    "cancelled": 7,
+}
+
+
+def _status_rank(status: str) -> int:
+    return _STATUS_RANK.get(str(status or "").strip().lower(), -1)
+
+
+# ---------------------------------------------------------------------------
+# Pydantic models
+# ---------------------------------------------------------------------------
 
 class BatchSummaryRow(BaseModel):
     summary_id: str = ""
@@ -220,10 +243,12 @@ class BatchSummarySyncPayload(BaseModel):
     mode: str = "replace"
     rows: list[BatchSummaryRow]
 
+
 class ReviewPayload(BaseModel):
     status: str = Field(pattern="^(approved|rejected)$")
     reviewedBy: str = ""
     reviewNote: str = ""
+    updatedAt: str = ""
     factory_pending: int | None = None
 
 
@@ -237,6 +262,7 @@ class AllocatePayload(BaseModel):
     contractNo: str = ""
     v7OrderNo: str = ""
     allocatedBy: str = ""
+
 
 class CompletePayload(BaseModel):
     v7OrderNo: str = ""
@@ -255,6 +281,26 @@ class AllocateLinesPayload(BaseModel):
     items: list[AllocateLineItem]
 
 
+class V8StatusPayload(BaseModel):
+    """
+    Unified status-push payload from the V8 factory system (V7 local).
+    Called via POST /api/dealer/orders/{order_no}/v8-status.
+
+    A single endpoint replaces the need to call /review, /contract, /allocate,
+    /complete separately — V8 decides the target status in one call.
+    """
+    status: str                          # approved | rejected | contracted | allocated | completed
+    reviewedBy: str = ""                 # operator name
+    reviewNote: str = ""                 # optional review note
+    contractNo: str = ""                 # filled when status is contracted/allocated/completed
+    v7OrderNo: str = ""                  # V7 internal sales order number
+    updatedAt: str = ""                  # ISO datetime string from V7 (informational)
+    factory_pending: int | None = None   # factory review pending flag
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
 def ensure_wechat_batch_summary_table(conn) -> None:
     with conn.cursor() as cur:
@@ -313,6 +359,11 @@ def _batch_summary_id(row: BatchSummaryRow) -> str:
     ])
     return hashlib.md5(raw.encode("utf-8")).hexdigest()
 
+
+# ---------------------------------------------------------------------------
+# Routes
+# ---------------------------------------------------------------------------
+
 @app.get("/health")
 def health():
     return {"ok": True, "version": BUILD_VERSION}
@@ -351,7 +402,6 @@ def debug_db():
     return result
 
 
-
 @app.post("/api/v7/wechat-batch-summary/sync", dependencies=[Depends(require_v7_key)])
 def sync_wechat_batch_summary(payload: BatchSummarySyncPayload):
     if payload.mode != "replace":
@@ -371,10 +421,6 @@ def sync_wechat_batch_summary(payload: BatchSummarySyncPayload):
                 model = _clean_text(row.model)
                 if not batch_no or not model:
                     continue
-                quantity = int(row.quantity or 0)
-                heightened = int(row.heightened or 0)
-                original_batch_no = _clean_text(row.original_batch_no)
-                original_expected = row.original_expected_inbound_time
                 cur.execute(
                     insert_sql,
                     (
@@ -382,23 +428,38 @@ def sync_wechat_batch_summary(payload: BatchSummarySyncPayload):
                         batch_no,
                         _empty_to_none(row.expected_inbound_time),
                         model,
-                        quantity,
-                        heightened,
-                        original_batch_no,
-                        _empty_to_none(original_expected),
+                        int(row.quantity or 0),
+                        int(row.heightened or 0),
+                        _clean_text(row.original_batch_no),
+                        _empty_to_none(row.original_expected_inbound_time),
                     ),
                 )
         conn.commit()
     return {"message": "ok", "rows": len(payload.rows)}
 
+
+# Statuses that V7 may query via GET /api/v7/dealer-orders
+_ALLOWED_LIST_STATUSES = {
+    "pending", "approved", "contracted",
+    "partial_allocated", "allocated",
+    "completed", "complete",
+    "rejected", "cancelled",
+}
+
+
 @app.get("/api/v7/dealer-orders", dependencies=[Depends(require_v7_key)])
 def list_dealer_orders(status: str = "pending", page: int = 1, page_size: int = 100):
-    allowed_statuses = {"pending", "approved", "contracted", "partial_allocated", "allocated", "completed"}
-    if status not in allowed_statuses:
-        raise HTTPException(status_code=422, detail="Unsupported status")
+    normalized = status.strip().lower()
+    if normalized not in _ALLOWED_LIST_STATUSES:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Unsupported status: {status!r}. Allowed: {sorted(_ALLOWED_LIST_STATUSES)}",
+        )
     page = max(1, page)
     page_size = min(max(1, page_size), 200)
     offset = (page - 1) * page_size
+    # Normalize "complete" alias to "completed" for DB query
+    db_status = "completed" if normalized == "complete" else normalized
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -410,15 +471,204 @@ def list_dealer_orders(status: str = "pending", page: int = 1, page_size: int = 
                 ORDER BY MAX(created_at) DESC, order_no DESC
                 LIMIT %s OFFSET %s
                 """,
-                (status, page_size, offset),
+                (db_status, page_size, offset),
             )
             order_nos = [row["order_no"] for row in cur.fetchall()]
         data = [summarize_order(fetch_order(conn, order_no)) for order_no in order_nos]
         return {"data": data, "page": page, "page_size": page_size}
 
 
+@app.post("/api/dealer/orders/{order_no}/v8-status", dependencies=[Depends(require_v7_key)])
+def v8_push_status(
+    order_no: str,
+    payload: V8StatusPayload,
+    request: Request,
+    idempotency_key: str = Header(default="", alias="Idempotency-Key"),
+):
+    """
+    V8 (factory / V7 local) → Cloud status push.
+
+    This unified endpoint replaces the pattern of calling /review, /contract,
+    /allocate, /complete separately. V7's outbox calls this with the final
+    desired status after any local operation.
+
+    Status mapping:
+      approved   → mark reviewed & approved (auto-fills approved_qty)
+      rejected   → mark rejected
+      contracted → auto-approve if pending, then mark contracted
+      allocated  → auto-approve if pending, then mark allocated
+      completed  → mark completed (regardless of intermediate steps)
+    """
+    target_status = _clean_text(payload.status).lower()
+    valid_push_statuses = {"approved", "rejected", "contracted", "allocated", "completed", "complete"}
+    if target_status not in valid_push_statuses:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Unsupported status for v8-status push: {target_status!r}. "
+                   f"Allowed: {sorted(valid_push_statuses)}",
+        )
+
+    path = str(request.url.path)
+    operator = _clean_text(payload.reviewedBy) or "v8-factory"
+    note = _clean_text(payload.reviewNote)
+    contract_no = _clean_text(payload.contractNo)
+    v7_order_no = _clean_text(payload.v7OrderNo)
+
+    with get_conn() as conn:
+        ensure_support_tables(conn)
+
+        # Idempotency: return cached response if same key already processed
+        cached = get_idempotent_response(conn, idempotency_key, "POST", path)
+        if cached:
+            return cached
+
+        rows = fetch_order(conn, order_no, for_update=True)
+        if not rows:
+            raise HTTPException(status_code=404, detail="Order not found")
+
+        old_statuses = {str(row.get("status") or "") for row in rows}
+        current_rank = max(_status_rank(s) for s in old_statuses)
+        incoming_rank = _status_rank(target_status)
+
+        # Never regress a status that is already ahead of the requested one
+        if current_rank > incoming_rank:
+            result = {
+                "message": "skipped: local status is already ahead of requested",
+                "local_status": max(old_statuses, key=_status_rank),
+                "requested_status": target_status,
+                "order": summarize_order(fetch_order(conn, order_no)),
+            }
+            save_idempotent_response(conn, idempotency_key, "POST", path, result)
+            conn.commit()
+            return result
+
+        with conn.cursor() as cur:
+            if target_status == "approved":
+                cur.execute(
+                    """
+                    UPDATE dealer_orders
+                    SET status='approved',
+                        approved_qty=CASE WHEN approved_qty=0 THEN quantity ELSE approved_qty END,
+                        reviewed_by=COALESCE(NULLIF(reviewed_by,''), %s),
+                        reviewed_at=COALESCE(reviewed_at, NOW()),
+                        review_note=CASE WHEN %s='' THEN review_note ELSE %s END,
+                        factory_pending=COALESCE(%s, factory_pending)
+                    WHERE order_no=%s AND status IN ('pending', 'approved')
+                    """,
+                    (operator, note, note, payload.factory_pending, order_no),
+                )
+
+            elif target_status == "rejected":
+                cur.execute(
+                    """
+                    UPDATE dealer_orders
+                    SET status='rejected',
+                        reviewed_by=COALESCE(NULLIF(reviewed_by,''), %s),
+                        reviewed_at=COALESCE(reviewed_at, NOW()),
+                        review_note=CASE WHEN %s='' THEN review_note ELSE %s END
+                    WHERE order_no=%s AND status NOT IN ('completed', 'complete', 'cancelled')
+                    """,
+                    (operator, note, note, order_no),
+                )
+
+            elif target_status == "contracted":
+                # Step 1: auto-approve if still pending
+                cur.execute(
+                    """
+                    UPDATE dealer_orders
+                    SET status='approved',
+                        approved_qty=CASE WHEN approved_qty=0 THEN quantity ELSE approved_qty END,
+                        reviewed_by=COALESCE(NULLIF(reviewed_by,''), %s),
+                        reviewed_at=COALESCE(reviewed_at, NOW())
+                    WHERE order_no=%s AND status='pending'
+                    """,
+                    (operator, order_no),
+                )
+                # Step 2: mark contracted
+                cur.execute(
+                    """
+                    UPDATE dealer_orders
+                    SET status='contracted',
+                        contract_no=CASE WHEN COALESCE(contract_no,'')='' THEN %s ELSE contract_no END,
+                        v7_order_no=CASE WHEN COALESCE(v7_order_no,'')='' THEN %s ELSE v7_order_no END,
+                        reviewed_by=COALESCE(NULLIF(reviewed_by,''), %s),
+                        reviewed_at=COALESCE(reviewed_at, NOW())
+                    WHERE order_no=%s AND status IN ('pending', 'approved')
+                    """,
+                    (contract_no, v7_order_no, operator, order_no),
+                )
+
+            elif target_status == "allocated":
+                # Auto-approve if pending
+                cur.execute(
+                    """
+                    UPDATE dealer_orders
+                    SET status='approved',
+                        approved_qty=CASE WHEN approved_qty=0 THEN quantity ELSE approved_qty END,
+                        reviewed_by=COALESCE(NULLIF(reviewed_by,''), %s),
+                        reviewed_at=COALESCE(reviewed_at, NOW())
+                    WHERE order_no=%s AND status='pending'
+                    """,
+                    (operator, order_no),
+                )
+                # Mark allocated
+                cur.execute(
+                    """
+                    UPDATE dealer_orders
+                    SET status='allocated',
+                        allocated_qty=quantity,
+                        contract_no=CASE WHEN COALESCE(contract_no,'')='' THEN %s ELSE contract_no END,
+                        v7_order_no=CASE WHEN COALESCE(v7_order_no,'')='' THEN %s ELSE v7_order_no END,
+                        reviewed_by=COALESCE(NULLIF(reviewed_by,''), %s),
+                        reviewed_at=COALESCE(reviewed_at, NOW())
+                    WHERE order_no=%s AND status NOT IN ('completed', 'complete', 'cancelled')
+                    """,
+                    (contract_no, v7_order_no, operator, order_no),
+                )
+
+            elif target_status in {"completed", "complete"}:
+                cur.execute(
+                    """
+                    UPDATE dealer_orders
+                    SET status='completed',
+                        allocated_qty=quantity,
+                        v7_order_no=CASE WHEN COALESCE(v7_order_no,'')='' THEN %s ELSE v7_order_no END,
+                        reviewed_by=COALESCE(NULLIF(reviewed_by,''), %s),
+                        reviewed_at=COALESCE(reviewed_at, NOW())
+                    WHERE order_no=%s AND status NOT IN ('cancelled')
+                    """,
+                    (v7_order_no, operator, order_no),
+                )
+
+        result = {
+            "message": "ok",
+            "requested_status": target_status,
+            "order": summarize_order(fetch_order(conn, order_no)),
+        }
+        log_operation(
+            conn,
+            order_no=order_no,
+            operation=f"v8-status:{target_status}",
+            operator=operator,
+            source_ip=request.client.host if request.client else "",
+            old_status=",".join(sorted(old_statuses)),
+            new_status=target_status,
+            idem_key=idempotency_key,
+            result="success",
+            detail=f"contract_no={contract_no} v7_order_no={v7_order_no} note={note}",
+        )
+        save_idempotent_response(conn, idempotency_key, "POST", path, result)
+        conn.commit()
+        return result
+
+
 @app.post("/api/v7/dealer-orders/{order_no}/review", dependencies=[Depends(require_v7_key)])
-def review_order(order_no: str, payload: ReviewPayload, request: Request, idempotency_key: str = Header(default="", alias="Idempotency-Key")):
+def review_order(
+    order_no: str,
+    payload: ReviewPayload,
+    request: Request,
+    idempotency_key: str = Header(default="", alias="Idempotency-Key"),
+):
     path = str(request.url.path)
     with get_conn() as conn:
         ensure_support_tables(conn)
@@ -483,7 +733,12 @@ def review_order(order_no: str, payload: ReviewPayload, request: Request, idempo
 
 
 @app.post("/api/v7/dealer-orders/{order_no}/contract", dependencies=[Depends(require_v7_key)])
-def contract_order(order_no: str, payload: ContractPayload, request: Request, idempotency_key: str = Header(default="", alias="Idempotency-Key")):
+def contract_order(
+    order_no: str,
+    payload: ContractPayload,
+    request: Request,
+    idempotency_key: str = Header(default="", alias="Idempotency-Key"),
+):
     path = str(request.url.path)
     with get_conn() as conn:
         ensure_support_tables(conn)
@@ -526,7 +781,12 @@ def contract_order(order_no: str, payload: ContractPayload, request: Request, id
 
 
 @app.post("/api/v7/dealer-orders/{order_no}/allocate", dependencies=[Depends(require_v7_key)])
-def allocate_order(order_no: str, payload: AllocatePayload, request: Request, idempotency_key: str = Header(default="", alias="Idempotency-Key")):
+def allocate_order(
+    order_no: str,
+    payload: AllocatePayload,
+    request: Request,
+    idempotency_key: str = Header(default="", alias="Idempotency-Key"),
+):
     path = str(request.url.path)
     with get_conn() as conn:
         ensure_support_tables(conn)
@@ -570,9 +830,13 @@ def allocate_order(order_no: str, payload: AllocatePayload, request: Request, id
         return result
 
 
-
 @app.post("/api/v7/dealer-orders/{order_no}/complete", dependencies=[Depends(require_v7_key)])
-def complete_order(order_no: str, payload: CompletePayload, request: Request, idempotency_key: str = Header(default="", alias="Idempotency-Key")):
+def complete_order(
+    order_no: str,
+    payload: CompletePayload,
+    request: Request,
+    idempotency_key: str = Header(default="", alias="Idempotency-Key"),
+):
     path = str(request.url.path)
     with get_conn() as conn:
         ensure_support_tables(conn)
@@ -614,8 +878,14 @@ def complete_order(order_no: str, payload: CompletePayload, request: Request, id
         conn.commit()
         return result
 
+
 @app.post("/api/v7/dealer-orders/{order_no}/allocate-lines", dependencies=[Depends(require_v7_key)])
-def allocate_order_lines(order_no: str, payload: AllocateLinesPayload, request: Request, idempotency_key: str = Header(default="", alias="Idempotency-Key")):
+def allocate_order_lines(
+    order_no: str,
+    payload: AllocateLinesPayload,
+    request: Request,
+    idempotency_key: str = Header(default="", alias="Idempotency-Key"),
+):
     path = str(request.url.path)
     with get_conn() as conn:
         ensure_support_tables(conn)
@@ -638,7 +908,10 @@ def allocate_order_lines(order_no: str, payload: AllocateLinesPayload, request: 
         with conn.cursor() as cur:
             for item in payload.items:
                 row = rows_by_line[item.lineNo]
-                line_status = "allocated" if item.allocatedQty >= int(row.get("quantity") or 0) else ("partial_allocated" if item.allocatedQty > 0 else row.get("status"))
+                line_status = (
+                    "allocated" if item.allocatedQty >= int(row.get("quantity") or 0)
+                    else ("partial_allocated" if item.allocatedQty > 0 else row.get("status"))
+                )
                 cur.execute(
                     """
                     UPDATE dealer_orders
